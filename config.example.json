@@ -1,0 +1,18 @@
+{
+  "hotkey": "right_ctrl",
+  "input_mode": "tray",
+  "quit_hotkey": "ctrl+alt+q",
+  "model_id": "Qwen/Qwen3-ASR-1.7B",
+  "model_profile": "qwen_1_7b_gpu",
+  "local_files_only": true,
+  "input_device": null,
+  "sample_rate": 16000,
+  "max_record_seconds": 60,
+  "recording_warning_seconds": 10,
+  "max_new_tokens": 1024,
+  "minimum_audio_seconds": 0.25,
+  "release_tail_seconds": 0.3,
+  "paste_delay_seconds": 0.12,
+  "restore_clipboard_after_paste": true,
+  "clean_fillers": true
+}
