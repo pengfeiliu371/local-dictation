@@ -19,7 +19,7 @@ It is designed primarily for Chinese, English, and natural Chinese-English code-
 - An NVIDIA GPU with a current CUDA-capable driver is strongly recommended.
 - A working default microphone, an internet connection for first-time setup, and several GB of free disk space.
 
-The included setup script validates CUDA and is therefore GPU-first. A CPU-only setup is possible with a CPU build of PyTorch and local adjustments, but it will be substantially slower.
+The setup script supports both GPU and CPU installations. In its default `auto` mode, it detects the NVIDIA driver tool and chooses GPU mode when available; otherwise it installs CPU-only PyTorch. CPU transcription is substantially slower.
 
 ## Recommended hardware
 
@@ -43,11 +43,23 @@ For everyday Chinese dictation with occasional English, use the 1.7B model when 
    cd local-dictation
    ```
 
-3. Run the one-time setup. It creates a virtual environment, installs CUDA PyTorch and dependencies, and downloads the default model:
+3. Run the one-time setup. It creates a virtual environment, selects GPU or CPU PyTorch, installs dependencies, and downloads a model:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
+
+   To explicitly choose the installation type instead of automatic detection:
+
+   ```powershell
+   # NVIDIA GPU / CUDA installation
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Mode gpu
+
+   # CPU-only installation (no CUDA or discrete GPU required)
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Mode cpu
+   ```
+
+   CPU mode automatically selects the smaller Qwen3-ASR 0.6B profile. It is a practical fallback for computers without an NVIDIA GPU, but long utterances will take noticeably longer to transcribe.
 
 4. Start the app:
 
@@ -101,4 +113,3 @@ When changing `model_id`, run `download_model.ps1` to pre-download it, or launch
 ## License
 
 [MIT](LICENSE)
-
