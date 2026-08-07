@@ -89,7 +89,443 @@ def model_is_cached(model_id: str) -> bool:
     snapshots = cache_root / f"models--{model_id.replace('/', '--')}" / "snapshots"
     if not snapshots.exists():
         return False
-    weight_suffixes = {".safetensors…5220 tokens truncated…    model_status.setText("Installed locally - model is loading.")
+    weight_suffixes = {".safetensors", ".bin", ".pt", ".pth"}
+    # Configuration/tokenizer files arrive first. They are not sufficient to
+    # run ASR, so require at least one substantial weight file before calling a
+    # model installed.
+    return any(
+        path.is_file() and path.suffix.lower() in weight_suffixes and path.stat().st_size > 100 * 1024 * 1024
+        for path in snapshots.rglob("*")
+    )
+
+
+class DictationApp:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        # Settings may save a different profile before the process restarts.
+        # Keep the actually loaded profile separate for accurate UI wording.
+        self.active_model_profile = config.get("model_profile", "qwen_1_7b_gpu")
+        self.audio_blocks: list[np.ndarray] = []
+        self.recording = False
+        self.finalizing_recording = False
+        self.recording_started_at: float | None = None
+        self.transcribing = False
+        self.ready = False
+        self.load_error: str | None = None
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        # Keep runtime diagnostics in the tool folder. This is writable even in
+        # managed Windows environments where AppData is protected.
+        self.log_path = ROOT / "codex-ptt-runtime.log"
+        self.target_window = 0
+        self.jobs: queue.Queue[np.ndarray | None] = queue.Queue()
+
+        self.model: Any | None = None
+        self.stream: sd.InputStream | None = None
+
+    def initialize(self) -> None:
+        """Load the GPU model in the background while the tray icon is visible."""
+        # These imports are intentionally delayed: importing CUDA PyTorch and
+        # Qwen takes several seconds on Windows, but the tray shell should be
+        # visible immediately after a desktop-shortcut launch.
+        import torch
+        from qwen_asr import Qwen3ASRModel
+
+        profile = MODEL_PROFILES.get(self.config.get("model_profile", ""), MODEL_PROFILES["qwen_1_7b_gpu"])
+        use_gpu = profile["device"] == "cuda"
+        if use_gpu and not torch.cuda.is_available():
+            self.load_error = "The selected GPU model cannot find an NVIDIA CUDA GPU. Choose the CPU profile in Settings."
+            self._log(self.load_error)
+            return
+
+        device_description = torch.cuda.get_device_name(0) if use_gpu else "CPU (slow mode)"
+        self._log(f"Loading {profile['model_id']} on {device_description} ...")
+        # language=None is deliberate: it preserves Chinese-English code switching
+        # better than forcing the whole utterance into a single language.
+        self.model = Qwen3ASRModel.from_pretrained(
+            profile["model_id"],
+            dtype=torch.bfloat16 if use_gpu else torch.float32,
+            device_map="cuda:0" if use_gpu else "cpu",
+            max_new_tokens=self.config.get("max_new_tokens", 1024),
+            # The packaged application may need to fetch the model on a new
+            # machine. The source version remains deliberately offline.
+            local_files_only=self.config.get("local_files_only", True) and not getattr(sys, "frozen", False),
+        )
+        template_name = profile.get("template")
+        if template_name and not getattr(self.model.processor, "chat_template", None):
+            # The original 0.6B checkpoint is otherwise fully compatible but
+            # omits this processor resource.  Supply the official template so
+            # Qwen-ASR can build its audio transcription prompt.
+            self.model.processor.chat_template = (ROOT / template_name).read_text(encoding="utf-8")
+
+        # Many Windows microphones reject a 16 kHz capture request. Capture at
+        # the device's native rate and resample each utterance to the ASR rate.
+        self.input_device = self.config.get("input_device")
+        device_info = sd.query_devices(self.input_device, kind="input")
+        self.capture_sample_rate = int(round(device_info["default_samplerate"]))
+        self._log(f"Microphone: {device_info['name']} ({self.capture_sample_rate} Hz)")
+        self.stream = sd.InputStream(
+            device=self.input_device,
+            samplerate=self.capture_sample_rate,
+            channels=1,
+            dtype="float32",
+            callback=self._audio_callback,
+        )
+        self.stream.start()
+        self.ready = True
+        self._log(f"Ready. Focus any text box, hold {self.config['hotkey']}, speak, then release it.")
+        threading.Thread(target=self._transcription_worker, daemon=True).start()
+
+    def _audio_callback(self, data: np.ndarray, _frames: int, _time: Any, status: sd.CallbackFlags) -> None:
+        if status:
+            self._log(f"Audio warning: {status}")
+        with self.lock:
+            if self.recording:
+                self.audio_blocks.append(data.copy())
+
+    def start_recording(self) -> None:
+        with self.lock:
+            if not self.ready or self.recording or self.finalizing_recording or self.transcribing:
+                return
+            self.audio_blocks.clear()
+            self.recording = True
+            self.recording_started_at = time.perf_counter()
+        self._log("[listening]")
+
+    def stop_recording(self) -> None:
+        with self.lock:
+            if not self.recording or self.finalizing_recording:
+                return
+            # Keep recording briefly after the key is released. Sounddevice
+            # callbacks can still contain the final syllable at that moment.
+            self.finalizing_recording = True
+
+        tail_seconds = self.config.get("release_tail_seconds", 0.30)
+        if tail_seconds > 0:
+            time.sleep(tail_seconds)
+
+        with self.lock:
+            self.recording = False
+            self.finalizing_recording = False
+            self.recording_started_at = None
+            audio = np.concatenate(self.audio_blocks, axis=0).reshape(-1) if self.audio_blocks else np.array([], dtype=np.float32)
+            self.audio_blocks.clear()
+
+        duration = len(audio) / self.capture_sample_rate
+        if duration < self.config["minimum_audio_seconds"]:
+            self._log("Ignored: recording was too short.")
+            return
+        if duration > self.config["max_record_seconds"]:
+            self._log(f"Recording capped at {self.config['max_record_seconds']} seconds.")
+            audio = audio[: int(self.config["max_record_seconds"] * self.capture_sample_rate)]
+        audio = self._resample_to_asr_rate(audio)
+        self.jobs.put(audio)
+
+    def recording_seconds(self) -> float:
+        with self.lock:
+            if not self.recording or self.recording_started_at is None:
+                return 0.0
+            return time.perf_counter() - self.recording_started_at
+
+    def _resample_to_asr_rate(self, audio: np.ndarray) -> np.ndarray:
+        target_rate = self.config["sample_rate"]
+        if self.capture_sample_rate == target_rate:
+            return audio
+        source_positions = np.arange(len(audio), dtype=np.float64)
+        target_length = round(len(audio) * target_rate / self.capture_sample_rate)
+        target_positions = np.linspace(0, len(audio) - 1, target_length)
+        return np.interp(target_positions, source_positions, audio).astype(np.float32)
+
+    def _clean_dictation(self, text: str) -> str:
+        """Remove standalone hesitation sounds without rewriting task content."""
+        if not self.config.get("clean_fillers", True):
+            return text
+
+        # Restrict matches to separate speech fragments. Words such as "就是"
+        # and "然后" are intentionally preserved because they may be meaningful.
+        filler = r"(?:嗯+|呃+|额+|啊+|唔+|噢+|哦+|um+|uh+|erm+)"
+        boundary = r"(?=[\s,，。！？；!?;]|$)"
+        # Consume the comma-like separator next to a removed filler as well.
+        # Otherwise "嗯，帮我…" becomes the dangling "，帮我…".
+        for _ in range(4):  # Handles consecutive fillers such as "呃，啊，…".
+            cleaned = re.sub(
+                rf"(^|[\s,，、;；]){filler}{boundary}[\s,，、;；]*",
+                r"\1",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if cleaned == text:
+                break
+            text = cleaned
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"([,，。！？；!?;])(?:\s*\1)+", r"\1", text)
+        text = re.sub(r"^[\s,，、;；]+", "", text)
+        text = re.sub(r"([。！？!?])\s*[,，、;；]+", r"\1", text)
+        text = re.sub(r"[,，、;；]+\s*([。！？!?])", r"\1", text)
+        text = re.sub(r"[,，、;；]+$", "", text)
+        text = re.sub(r"\s+([,，。！？；!?;])", r"\1", text)
+        return text.strip()
+
+    def _transcription_worker(self) -> None:
+        while True:
+            audio = self.jobs.get()
+            if audio is None:
+                return
+            with self.lock:
+                self.transcribing = True
+            try:
+                started = time.perf_counter()
+                self._log("Transcribing locally on GPU...")
+                if self.model is None:
+                    raise RuntimeError("ASR model is not ready.")
+                result = self.model.transcribe(audio=(audio, self.config["sample_rate"]), language=None)
+                asr_elapsed = time.perf_counter() - started
+                text = result[0].text.strip() if result else ""
+                cleanup_started = time.perf_counter()
+                text = self._clean_dictation(text)
+                cleanup_elapsed = time.perf_counter() - cleanup_started
+                if text:
+                    paste_started = time.perf_counter()
+                    self._paste(text)
+                    paste_elapsed = time.perf_counter() - paste_started
+                    self._log(
+                        f"[pasted in {time.perf_counter() - started:.2f}s; "
+                        f"ASR {asr_elapsed:.2f}s, cleanup {cleanup_elapsed * 1000:.1f}ms, "
+                        f"paste {paste_elapsed:.2f}s] {text}"
+                    )
+                else:
+                    self._log("No speech recognized.")
+            except Exception as error:  # Keep the hotkey listener alive after a failed utterance.
+                self._log(f"Transcription failed: {error}")
+            finally:
+                with self.lock:
+                    self.transcribing = False
+
+    def _paste(self, text: str) -> None:
+        old_clipboard: str | None = None
+        if self.config["restore_clipboard_after_paste"]:
+            try:
+                old_clipboard = pyperclip.paste()
+            except pyperclip.PyperclipException:
+                pass
+
+        pyperclip.copy(text)
+        if self.target_window:
+            ctypes.windll.user32.SetForegroundWindow(self.target_window)
+            time.sleep(0.08)
+        time.sleep(self.config["paste_delay_seconds"])
+        controller = keyboard.Controller()
+        with controller.pressed(keyboard.Key.ctrl):
+            controller.press("v")
+            controller.release("v")
+        # Do not restore immediately: some apps read clipboard asynchronously.
+        if old_clipboard is not None:
+            time.sleep(0.25)
+            pyperclip.copy(old_clipboard)
+
+    def _log(self, message: str) -> None:
+        line = f"{time.strftime('%H:%M:%S')} {message}"
+        print(line, flush=True)
+        try:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as error:
+            # Logging must never prevent dictation from starting (for example,
+            # after a previous elevated launch created a protected log file).
+            print(f"Log write skipped: {error}", file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.jobs.put(None)
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+
+
+class TrayController:
+    """Minimal Windows tray UI with a non-activating listening indicator."""
+
+    def __init__(self, app: DictationApp) -> None:
+        self.app = app
+        self.qt_app = QApplication.instance() or QApplication(sys.argv)
+        self.qt_app.setQuitOnLastWindowClosed(False)
+        self.tray = QSystemTrayIcon(QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.exists() else self._mic_icon("#2f80ed"), self.qt_app)
+        self.tray.setToolTip("Local Dictation — hold Right Ctrl to talk")
+        # Keep Python references to the menu and actions.  A menu stored only
+        # in a local variable can be garbage-collected by PySide on some
+        # Windows builds, leaving a visible tray icon with no context menu.
+        self.menu = QMenu(self.qt_app)
+        self.status_action = QAction("Ready — hold Right Ctrl to talk", self.menu)
+        self.status_action.setEnabled(False)
+        self.menu.addAction(self.status_action)
+        self.settings_action = QAction("Settings…", self.menu)
+        self.settings_action.triggered.connect(self._open_settings)
+        self.menu.addAction(self.settings_action)
+        self.menu.addSeparator()
+        self.exit_action = QAction("Exit", self.menu)
+        self.exit_action.triggered.connect(self._exit)
+        self.menu.addAction(self.exit_action)
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._handle_tray_activation)
+        self.tray.show()
+
+        self.indicator = QWidget()
+        self.indicator.setWindowFlags(
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.indicator.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.indicator.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        card = QFrame(self.indicator)
+        card.setStyleSheet(
+            "QFrame { background: rgba(28, 32, 40, 235); border: 1px solid #4d5968; border-radius: 16px; }"
+            "QLabel { color: white; font-family: 'Segoe UI'; }"
+        )
+        self.indicator_card = card
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(22, 14, 22, 16)
+        self.indicator_icon = QLabel("🎙")
+        self.indicator_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.indicator_icon.setStyleSheet("font-size: 31px; color: #ff5a5f;")
+        self.indicator_text = QLabel("Listening…")
+        self.indicator_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.indicator_text.setStyleSheet("font-size: 13px; font-weight: 600;")
+        layout.addWidget(self.indicator_icon)
+        layout.addWidget(self.indicator_text)
+        root_layout = QVBoxLayout(self.indicator)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(card)
+        self.indicator.resize(164, 110)
+
+        self.last_state = "idle"
+        self.last_text = ""
+        self.ready_notification_sent = False
+        self.error_notification_sent = False
+        self.model_download_process: QProcess | None = None
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self._sync_status)
+        self.status_timer.start(80)
+
+    @staticmethod
+    def _mic_icon(color: str) -> QIcon:
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(6, 6, 52, 52)
+        painter.setBrush(QColor("white"))
+        painter.drawRoundedRect(27, 16, 10, 22, 5, 5)
+        painter.drawRoundedRect(21, 23, 22, 22, 10, 10)
+        painter.drawRect(30, 43, 4, 8)
+        painter.drawRoundedRect(23, 50, 18, 4, 2, 2)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _sync_status(self) -> None:
+        if self.app.load_error:
+            state, text, color = "error", "Local Dictation failed to start", "#e74c3c"
+        elif not self.app.ready:
+            profile = MODEL_PROFILES.get(self.app.active_model_profile, MODEL_PROFILES["qwen_1_7b_gpu"])
+            device_name = "GPU" if profile["device"] == "cuda" else "CPU"
+            state, text, color = "loading", f"Loading local {device_name} model…", "#7f8c8d"
+        elif self.app.recording:
+            remaining = max(0, self.app.config["max_record_seconds"] - self.app.recording_seconds())
+            warning_seconds = self.app.config.get("recording_warning_seconds", 10)
+            if remaining <= warning_seconds:
+                state, text, color = "listening_warning", f"Listening… {max(0, int(remaining + 0.999))} seconds left", "#e74c3c"
+            else:
+                state, text, color = "listening", "Listening…", "#2f80ed"
+        elif self.app.transcribing:
+            state, text, color = "working", "Transcribing locally…", "#f39c12"
+        else:
+            state, text, color = "idle", "Ready — hold Right Ctrl to talk", "#2f80ed"
+        if state == self.last_state and text == self.last_text:
+            return
+        self.last_state = state
+        self.last_text = text
+        self.tray.setIcon(self._mic_icon(color))
+        self.status_action.setText(text)
+        if state in ("idle", "loading", "error"):
+            self.indicator.hide()
+        else:
+            self.indicator_text.setText(text)
+            self.indicator_card.setStyleSheet(
+                "QFrame { background: rgba(28, 32, 40, 235); "
+                f"border: 2px solid {color}; border-radius: 16px; }}"
+                "QLabel { color: white; font-family: 'Segoe UI'; }"
+            )
+            self.indicator.move(self.qt_app.primaryScreen().availableGeometry().center() - self.indicator.rect().center())
+            self.indicator.show()
+        if state == "idle" and not self.ready_notification_sent:
+            self.ready_notification_sent = True
+            self.tray.showMessage(
+                "Local Dictation is ready",
+                "Hold Right Ctrl to dictate.",
+                QSystemTrayIcon.MessageIcon.Information,
+                5000,
+            )
+        elif state == "error" and not self.error_notification_sent:
+            self.error_notification_sent = True
+            self.tray.showMessage(
+                "Local Dictation could not start",
+                self.app.load_error or "Check the selected model in Settings.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                7000,
+            )
+
+    def _exit(self) -> None:
+        self.app.stop_event.set()
+        self.tray.hide()
+        self.qt_app.quit()
+
+    def _handle_tray_activation(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        # A double-click gives users an additional reliable way to reach
+        # Settings, including when Windows shell extensions interfere with
+        # a right-click on the notification-area icon.
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._open_settings()
+
+    def _open_settings(self) -> None:
+        dialog = QDialog()
+        dialog.setWindowTitle("Local Dictation Settings")
+        dialog.setModal(True)
+        dialog.setFixedWidth(390)
+        layout = QVBoxLayout(dialog)
+        model_label = QLabel("Recognition model")
+        layout.addWidget(model_label)
+        model_profile = QComboBox()
+        for profile_id, profile in MODEL_PROFILES.items():
+            model_profile.addItem(profile["label"], profile_id)
+        current_profile = self.app.config.get("model_profile", "qwen_1_7b_gpu")
+        current_index = model_profile.findData(current_profile)
+        model_profile.setCurrentIndex(max(0, current_index))
+        layout.addWidget(model_profile)
+        model_hint = QLabel()
+        model_hint.setWordWrap(True)
+        model_hint.setStyleSheet("color: #5f6368; font-size: 11px;")
+        model_status = QLabel()
+        model_status.setWordWrap(True)
+        download_button = QPushButton("Download selected model")
+        download_progress = QProgressBar()
+        download_progress.setRange(0, 100)
+        download_progress.setValue(0)
+        download_progress.setVisible(False)
+        restart_button = QPushButton("Restart now")
+        restart_button.setToolTip("Save these settings and restart Local Dictation.")
+
+        def refresh_model_hint(index: int) -> None:
+            profile_id = model_profile.itemData(index)
+            profile = MODEL_PROFILES[profile_id]
+            installed = model_is_cached(profile["model_id"])
+            model_hint.setText(profile["description"])
+            if self.model_download_process and self.model_download_process.state() != QProcess.ProcessState.NotRunning:
+                return
+            if installed:
+                if profile_id == self.app.active_model_profile and self.app.ready:
+                    model_status.setText("Active now.")
+                elif profile_id == self.app.active_model_profile:
+                    model_status.setText("Installed locally - model is loading.")
                 else:
                     model_status.setText("Installed locally - click Restart now to switch to it.")
                 model_status.setStyleSheet("color: #27803c; font-size: 11px;")
