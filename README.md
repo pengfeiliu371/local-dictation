@@ -92,7 +92,9 @@ When changing `model_id`, run `download_model.ps1` to pre-download it, or launch
 
 ## Troubleshooting
 
-**The hotkey does nothing.** Confirm that the tray icon is ready, no other app owns the same hotkey, and inspect `codex-ptt.log`. If the target application is running as Administrator, run Local Dictation as Administrator too.
+**The tray icon does not appear.** Start Local Dictation from its Desktop shortcut or an interactive PowerShell window. Do not launch this GUI app from a background automation or Codex tool session: Windows may allow that process to run while denying it access to the interactive notification area. The launcher and app include safeguards that prevent such an invisible process from blocking a later Desktop launch.
+
+**The hotkey does nothing.** Confirm that the tray icon is ready and no other app owns the same hotkey. Runtime diagnostics are written to `%TEMP%\LocalDictation\local-dictation.log`. If the target application is running as Administrator, run Local Dictation as Administrator too.
 
 **Text is not pasted.** Make sure focus is in a normal editable field. Password fields and protected applications may block clipboard access or simulated keystrokes.
 

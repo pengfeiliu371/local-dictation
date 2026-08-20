@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import tempfile
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -114,9 +115,15 @@ class DictationApp:
         self.load_error: str | None = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        # Keep runtime diagnostics in the tool folder. This is writable even in
-        # managed Windows environments where AppData is protected.
-        self.log_path = ROOT / "codex-ptt-runtime.log"
+        # Use the per-user temporary directory.  A project-folder log
+        # can be left behind by an elevated launch with permissions that later
+        # prevent ordinary desktop-shortcut launches from recording errors.
+        log_directory = Path(tempfile.gettempdir()) / "LocalDictation"
+        try:
+            log_directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log_directory = ROOT
+        self.log_path = log_directory / "local-dictation.log"
         self.target_window = 0
         self.jobs: queue.Queue[np.ndarray | None] = queue.Queue()
 
@@ -325,14 +332,24 @@ class DictationApp:
 
     def _log(self, message: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {message}"
-        print(line, flush=True)
+        # Desktop shortcuts launch with a hidden console.  On some Windows
+        # builds its stdout handle is invalid, so an unguarded print here can
+        # terminate the background model-initialization thread before the tray
+        # icon becomes ready.
+        try:
+            print(line, flush=True)
+        except (OSError, AttributeError):
+            pass
         try:
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
         except OSError as error:
             # Logging must never prevent dictation from starting (for example,
             # after a previous elevated launch created a protected log file).
-            print(f"Log write skipped: {error}", file=sys.stderr, flush=True)
+            try:
+                print(f"Log write skipped: {error}", file=sys.stderr, flush=True)
+            except (OSError, AttributeError):
+                pass
 
     def close(self) -> None:
         self.stop_event.set()
@@ -354,7 +371,9 @@ class TrayController:
         # Keep Python references to the menu and actions.  A menu stored only
         # in a local variable can be garbage-collected by PySide on some
         # Windows builds, leaving a visible tray icon with no context menu.
-        self.menu = QMenu(self.qt_app)
+        # QMenu only accepts a QWidget parent; QApplication is not one.  The
+        # controller's self.menu reference below keeps the menu alive.
+        self.menu = QMenu()
         self.status_action = QAction("Ready — hold Right Ctrl to talk", self.menu)
         self.status_action.setEnabled(False)
         self.menu.addAction(self.status_action)
@@ -368,6 +387,10 @@ class TrayController:
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._handle_tray_activation)
         self.tray.show()
+        # Explorer occasionally misses a tray registration during desktop
+        # startup. Reassert visibility after the Qt event loop has started and
+        # record whether Windows assigned an icon rectangle.
+        QTimer.singleShot(1500, self._ensure_tray_visible)
 
         self.indicator = QWidget()
         self.indicator.setWindowFlags(
@@ -473,6 +496,32 @@ class TrayController:
                 QSystemTrayIcon.MessageIcon.Warning,
                 7000,
             )
+
+    def _ensure_tray_visible(self) -> None:
+        self.tray.setVisible(True)
+        geometry = self.tray.geometry()
+        has_geometry = geometry.width() > 0 and geometry.height() > 0
+        self.app._log(
+            "Tray icon registered: "
+            f"visible={self.tray.isVisible()}, "
+            f"available={QSystemTrayIcon.isSystemTrayAvailable()}, "
+            f"geometry={geometry.x()},{geometry.y()},{geometry.width()}x{geometry.height()}"
+        )
+        if has_geometry:
+            return
+
+        if os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_CI"):
+            self.app._log(
+                "No interactive tray was assigned in the Codex background session; "
+                "exiting so the Desktop shortcut is not blocked."
+            )
+            self._exit()
+            return
+
+        # Explorer may still be starting or may just have restarted. Retry in
+        # normal interactive sessions without terminating a valid dictation
+        # process whose icon Windows placed in the overflow area.
+        QTimer.singleShot(3000, lambda: self.tray.setVisible(True))
 
     def _exit(self) -> None:
         self.app.stop_event.set()
